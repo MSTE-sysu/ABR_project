@@ -1,0 +1,196 @@
+#!/usr/bin/env python3.10
+from socket import *
+import sys
+import logging
+import re
+import xml.etree.ElementTree as ET
+import time
+import threading
+
+buffer_size = 2048
+
+def modifyMpd(message):
+    target = "BigBuckBunny_6s.mpd"
+    modified = "BigBuckBunny_6s_nolist.mpd"
+    result = re.search(target, message)
+    exist = False
+    modMessage = ""
+    if result:
+        exist = True
+        rnge = result.span()
+        prev = message[0:rnge[0]]
+        post = message[rnge[1]:]
+        modMessage = prev + modified + post
+    return exist, message.encode(), modMessage.encode()
+
+def findHeader(srvMessage):
+    header = ""
+    count = 0
+    while True:
+        try:
+            decoded = srvMessage[count].decode()
+            header += decoded
+            count += 1
+        except:
+            break
+    rnge = re.search('\r\n\r\n', header).span()
+    header = header[0:rnge[1]]
+    return header
+
+def findCL(header):
+    target = "Content-Length: "
+    result = re.search(target, header)
+    if not result:
+        return False
+    rnge = result.span()
+    i = rnge[1]
+    CL = ""
+    while header[i] != '\r':
+        if header[i].isdigit():
+            CL += header[i]
+            i += 1
+    return int(CL)
+
+def modRate(header, rate, codingRate):
+    target = "/bunny_"
+    result = re.search(target, header)
+    if not result:
+        return False, header.encode(), None
+    rnge = result.span()
+    i = rnge[1]
+    while header[i].isdigit():
+        i += 1
+    prev = header[0:rnge[1]]
+    post = header[i:]
+
+    targetRate = None
+    rate /= 1.5
+    left = 0
+    right = len(codingRate)
+    while left < right:
+        mid = (left+right)//2
+        if codingRate[mid] > rate:
+            right = mid
+        elif codingRate[mid] == rate:
+            targetRate = codingRate[mid]
+            break
+        elif codingRate[mid] < rate:
+            left = mid + 1
+    if not targetRate:
+        if left > 0:
+            targetRate = codingRate[left-1]
+        else:
+            targetRate = codingRate[0]
+    return True, (prev + str(targetRate) + post).encode(), targetRate
+
+def getChunkName(header):
+    target = "GET "
+    result = re.search(target, header)
+    if not result:
+        return False
+    rnge = result.span()
+    i = rnge[1]
+    while header[i] != " ":
+        i += 1
+    return header[rnge[1]:i]
+
+def getCodingRate(dir):
+    res = []
+    mytree = ET.parse(dir)
+    for elem in mytree.iter(tag = "{urn:mpeg:dash:schema:mpd:2011}Representation"):
+        res.append(int(elem.attrib['bandwidth']))
+    res.sort()
+    return res
+
+def proxyRecv(serverSocket, srvMessage, CL, HL):
+    forwardMessage = srvMessage
+    while len(forwardMessage) < HL+CL:
+        nxtSlice = serverSocket.recv(buffer_size)
+        forwardMessage += nxtSlice
+    return forwardMessage
+
+def play(rateQueue, fakeIp, fakePort, serverIp, serverPort, logDir, clientSocket, alpha):
+    serverSocket = socket(AF_INET, SOCK_STREAM)
+    serverSocket.bind((fakeIp, fakePort))
+    serverSocket.connect((serverIp, serverPort))
+
+    codingRate = rateQueue[0]
+    rate = float('inf')
+
+    while True:
+        cliMessage = clientSocket.recv(buffer_size)
+        exist, cliMessage, modMessage = modifyMpd(cliMessage.decode())
+
+        if not exist:
+            ischunk, cliMessage, requestRate = modRate(cliMessage.decode(), rate, codingRate)
+            chunkName = getChunkName(cliMessage.decode())
+            ts = time.time()
+            serverSocket.send(cliMessage)
+            srvMessage = serverSocket.recv(buffer_size)
+            print("Client request:")
+            print(cliMessage.decode())
+        else:
+            serverSocket.send(cliMessage)
+            print("Proxy request:")
+            print(cliMessage.decode())
+            proxyMessage = serverSocket.recv(buffer_size)
+            header = findHeader(proxyMessage)
+            mdpBytes = proxyMessage[len(header):]
+            with open("list.mpd","wb") as binary_file:
+                binary_file.write(mdpBytes)
+            if not codingRate:
+                codingRate = getCodingRate("list.mpd")
+                rateQueue[0] = codingRate
+            serverSocket.send(modMessage)
+            print("Client request:")
+            print(cliMessage.decode())
+            srvMessage = serverSocket.recv(buffer_size)
+
+        header = findHeader(srvMessage)
+        CL = findCL(header)
+        print('Server response:')
+        print(header)
+        srvMessage = proxyRecv(serverSocket, srvMessage, CL, len(header))
+        te = time.time()
+        tRange = te-ts
+        print('Start time = '+str(ts))
+        print('End time = '+str(te))
+        print('Tranmission time = '+str(tRange))
+        if CL and ischunk:
+            if rate == float('inf'):
+                rate = CL / tRange
+            else:
+                rate = alpha*(CL/tRange) + (1-alpha)*rate
+            print('Current throughput ='+str(rate/1000)+'KB/s')
+            logFile = open(logDir, 'a')
+            logFile.writelines(str(time.time()) + " " + str(tRange) + " " + str((CL/tRange)/1000) + " " + str(rate/1000) + " " + str(int(requestRate/1000)) + " ")
+            logFile.writelines(serverIp + " " + chunkName + "\n")
+            logFile.close()
+        print('\n')
+
+        clientSocket.send(srvMessage)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 6:
+        print("Invalid input parameters")
+        exit(0)
+    
+    logDir = sys.argv[1]
+    alpha = float(sys.argv[2])
+    listenPort = int(sys.argv[3])
+    fakeIp = sys.argv[4]
+    serverIp = sys.argv[5]
+    fakePort = 0
+    serverPort = 8080
+
+    listenSocket = socket(AF_INET, SOCK_STREAM)
+    listenSocket.bind(("", listenPort))
+    listenSocket.listen(10)
+
+    rateQueue = [[]]
+
+    while True:
+        clientSocket, addr = listenSocket.accept()
+        thread = threading.Thread(target = play, args = (rateQueue, fakeIp, fakePort, serverIp, serverPort, logDir, clientSocket, alpha))
+        thread.start()
